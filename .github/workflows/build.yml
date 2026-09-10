@@ -10,14 +10,64 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # Java (exact version that works with AGP 8.7+)
+      # 1. Décompresser le zip s'il est présent à la racine
+      # ------------------------------------------------------------------
+      - name: Extraire le zip du projet
+        run: |
+          echo "=== Contenu actuel du dépôt ==="
+          ls -la
+          
+          ZIP=$(find . -maxdepth 1 -name "*.zip" | head -1)
+          
+          if [ -n "$ZIP" ]; then
+            echo "Zip trouvé : $ZIP"
+            echo "Extraction en cours..."
+            unzip -o "$ZIP" -d extracted
+            echo "=== Contenu après extraction ==="
+            find extracted -maxdepth 3 -type d | head -40
+          else
+            echo "Aucun zip trouvé à la racine. On suppose que le code source est déjà présent."
+            mkdir -p extracted
+            # Copier tout ce qui n'est pas .git dans extracted pour uniformiser
+            find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name 'extracted' -exec cp -r {} extracted/ \; 2>/dev/null || true
+          fi
+
+      # ------------------------------------------------------------------
+      # 2. Localiser le vrai dossier du projet Android
+      # ------------------------------------------------------------------
+      - name: Localiser le projet Android
+        id: locate
+        run: |
+          # Cherche un dossier qui contient settings.gradle ou settings.gradle.kts
+          SETTINGS=$(find extracted -name "settings.gradle" -o -name "settings.gradle.kts" 2>/dev/null | head -1)
+          
+          if [ -z "$SETTINGS" ]; then
+            # Essai plus large
+            SETTINGS=$(find . -name "settings.gradle" -o -name "settings.gradle.kts" 2>/dev/null | head -1)
+          fi
+          
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Impossible de trouver settings.gradle(.kts). Structure du dépôt :"
+            find . -maxdepth 4 -type f | head -50
+            exit 1
+          fi
+          
+          PROJ=$(dirname "$SETTINGS")
+          echo "Projet Android trouvé : $PROJ"
+          echo "project_dir=$PROJ" >> "$GITHUB_OUTPUT"
+          
+          # Affiche la structure pour debug
+          ls -la "$PROJ"
+
+      # ------------------------------------------------------------------
+      # 3. Java
       # ------------------------------------------------------------------
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -27,10 +77,95 @@ jobs:
           cache: 'gradle'
 
       # ------------------------------------------------------------------
-      # Android SDK – explicit installation to avoid "SDK location not found"
+      # 4. Android SDK
       # ------------------------------------------------------------------
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install required SDK components
+      - name: Installer les composants SDK
         run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+          
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms/" || true
+
+      # ------------------------------------------------------------------
+      # 5. local.properties + wrapper
+      # ------------------------------------------------------------------
+      - name: Préparer le projet
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          cat local.properties
+          
+          if [ ! -f "./gradlew" ]; then
+            echo "Génération du wrapper Gradle..."
+            gradle wrapper --gradle-version 8.9 || true
+          fi
+          
+          # Corriger les fins de ligne Windows + permissions
+          sed -i 's/\r$//' gradlew 2>/dev/null || true
+          chmod +x gradlew
+          ./gradlew --version
+
+      # ------------------------------------------------------------------
+      # 6. Build
+      # ------------------------------------------------------------------
+      - name: Build Debug APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: ./gradlew assembleDebug --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build-debug.log"
+
+      - name: Build Release APK (unsigned)
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: ./gradlew assembleRelease --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build-release.log" || true
+
+      # ------------------------------------------------------------------
+      # 7. Collecter les APK
+      # ------------------------------------------------------------------
+      - name: Préparer les livrables
+        if: always()
+        run: |
+          mkdir -p out_package
+          
+          # Cherche les APK partout
+          find ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk -name "*.apk" -exec cp -v {} out_package/ \; 2>/dev/null || true
+          find . -name "*.apk" -path "*/outputs/apk/*" -exec cp -v {} out_package/ \; 2>/dev/null || true
+          
+          cp -v build-*.log out_package/ 2>/dev/null || true
+          
+          {
+            echo "HyperLauncher V2 - Build GitHub Actions"
+            echo "Date   : $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "Commit : ${{ github.sha }}"
+            echo ""
+            echo "APKs :"
+            ls -lh out_package/*.apk 2>/dev/null || echo "  Aucun APK trouvé"
+          } > out_package/README.txt
+          
+          cd out_package && zip -r ../HyperLauncher_Release.zip . || true
+
+      - name: Upload APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperLauncher-APK
+          path: |
+            out_package/*.apk
+            out_package/*.log
+            out_package/README.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload package complet
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperLauncher_Release
+          path: HyperLauncher_Release.zip
+          if-no-files-found: warn
+          retention-days: 14
+          
